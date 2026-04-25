@@ -88,6 +88,20 @@ kps_stabilize: float = 0.6
 # 0.0 disables. Off by default (~10ms extra/face) — typical good value 0.6-0.8.
 grain_match: float = 0.0
 
+# Reuse the previous aligned-face inswapper output when the target face has
+# barely moved.  Skipping the ~65 ms ANE inference and just re-pasting the
+# cached fake at the new face position costs ~10 ms total — pushes sustained
+# FPS from ~12 to 50+ on Apple Silicon.  Quality cost: fine expression changes
+# (blink, mouth) lag by up to swap_cache_max_age_ms — refresh as soon as the
+# face moves enough or the timer expires.  0.0 disables either limit.
+#
+# Defaults tuned for typical webcam usage on M3 Pro:
+#   threshold_px=5.0 — catches detector jitter (~1-2px) and slow drift
+#                      without staling expression updates during real motion
+#   max_age_ms=300   — at 30 FPS, forces a refresh every ~9 frames at most
+swap_cache_threshold_px: float = 5.0
+swap_cache_max_age_ms: float = 300.0
+
 # --- END OF FILE globals.py ---
 
 import threading

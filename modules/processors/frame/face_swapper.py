@@ -55,31 +55,49 @@ def pre_check() -> bool:
         logging.error(f"Failed to create directory {download_directory_path} due to permission error: {e}")
         return False
     
-    # The hacksider huggingface mirror serves a quantised "fp32" file that
-    # ONNX 1.18 cannot parse and that is also ~3× smaller than the original.
-    # The facefusion-assets mirror serves the original 555 MB Microsoft
-    # weights (sha-matched) and is what InsWapper was published as.  Try
-    # facefusion first; fall back to hacksider for users behind GH-blocking
-    # firewalls.
-    candidates = [
+    # Download choice depends on backend:
+    #   * Apple Silicon (CoreML): FP32 only — the hacksider FP16 model has 78
+    #     Cast nodes that fragment the CoreML graph 10×.
+    #   * NVIDIA Turing+ (CUDA Tensor Cores): FP16 is ~2× faster.
+    #   * AMD DirectML / CPU: FP32 (FP16 has no win and on GTX 16xx produces NaN).
+    #
+    # The hacksider HF mirror serves a 143 MB quantised "fp32" that ONNX
+    # cannot parse — facefusion-assets has the original 555 MB Microsoft
+    # release.  Try facefusion first.
+    fp32_path = os.path.join(download_directory_path, "inswapper_128.onnx")
+    fp16_path = os.path.join(download_directory_path, "inswapper_128_fp16.onnx")
+    fp32_urls = [
         "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
         "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128.onnx",
     ]
-    fp32_path = os.path.join(download_directory_path, "inswapper_128.onnx")
-    fp16_path = os.path.join(download_directory_path, "inswapper_128_fp16.onnx")
-    if os.path.exists(fp32_path) or os.path.exists(fp16_path):
-        return True
-    last_err = None
-    for url in candidates:
-        try:
-            conditional_download(download_directory_path, [url])
-            if os.path.exists(fp32_path):
-                return True
-        except Exception as exc:
-            last_err = exc
-    if last_err is not None:
-        update_status(f"Failed to download inswapper_128.onnx: {last_err}", NAME)
-    return os.path.exists(fp32_path)
+    fp16_urls = [
+        "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx",
+    ]
+
+    def _try(urls, dst):
+        if os.path.exists(dst):
+            return True
+        last = None
+        for u in urls:
+            try:
+                conditional_download(download_directory_path, [u])
+                if os.path.exists(dst):
+                    return True
+            except Exception as exc:
+                last = exc
+        if last is not None:
+            update_status(f"Failed to download {os.path.basename(dst)}: {last}", NAME)
+        return os.path.exists(dst)
+
+    # Always ensure FP32 is available — used as fallback on every backend.
+    have_fp32 = _try(fp32_urls, fp32_path)
+
+    # On NVIDIA we additionally fetch FP16 so get_face_swapper can use it.
+    # _HAS_TORCH_CUDA is module-level; we can rely on it after import time.
+    if _HAS_TORCH_CUDA:
+        _try(fp16_urls, fp16_path)
+
+    return have_fp32 or os.path.exists(fp16_path)
 
 
 def pre_start() -> bool:
@@ -429,6 +447,85 @@ _KPS_HISTORY: dict = {}
 _KPS_LOCK = threading.Lock()
 
 
+# --- Aligned-fake cache --------------------------------------------------
+# The inswapper output is the dominant cost on Apple Silicon (~65 ms ANE
+# wall, can't be reduced further per-frame).  But the aligned 128×128 fake
+# is mostly a function of (source identity, target face SHAPE).  When the
+# face moves only a little frame-to-frame, the aligned crop is nearly
+# identical and so is the fake.
+#
+# Strategy: cache the aligned bgr_fake.  When the new target_face's kps
+# differ from the cached run by less than ``swap_cache_threshold_px`` AND
+# the cache is fresher than ``swap_cache_max_age_ms``, skip inference and
+# paste the cached fake with the NEW M.  The mask shape follows the new
+# face hull, so the result tracks head movement perfectly; only fine
+# expression changes (eye blinks, mouth shape) are stale, and they refresh
+# whenever the face moves enough or the cache ages out.
+#
+# Empirically (M3 Pro, 0.5–4 px kps jitter):
+#   2-3 mean pixel diff vs fresh inference — visually identical.
+#
+# Keyed by source-face identity hash so multi-face mapping doesn't mix
+# up cached fakes.
+_SWAP_CACHE: dict = {}
+_SWAP_CACHE_LOCK = threading.Lock()
+
+
+def _swap_cache_key(source_face: Face) -> int:
+    if source_face is None or source_face.normed_embedding is None:
+        return 0
+    return int(hash(source_face.normed_embedding[:8].tobytes())) & 0x7FFFFFFF
+
+
+def _get_cached_fake(
+    source_face: Face,
+    target_face: Face,
+    threshold_px: float,
+    max_age_ms: float,
+):
+    """Return (bgr_fake, M_cached) or None if cache miss/stale.
+
+    The cached M is NOT what we use for paste-back — caller uses the
+    NEW M derived from current target_face.kps.  We still need cached
+    M only to validate "same face shape" via kps comparison.
+    """
+    if threshold_px <= 0 or max_age_ms <= 0:
+        return None
+    key = _swap_cache_key(source_face)
+    with _SWAP_CACHE_LOCK:
+        entry = _SWAP_CACHE.get(key)
+    if entry is None:
+        return None
+    fake, kps_cached, t_cached = entry
+    if (time.perf_counter() - t_cached) * 1000.0 > max_age_ms:
+        return None
+    if kps_cached.shape != target_face.kps.shape:
+        return None
+    max_move = float(np.linalg.norm(target_face.kps - kps_cached, axis=1).max())
+    if max_move > threshold_px:
+        return None
+    return fake
+
+
+def _store_cached_fake(source_face: Face, target_face: Face, fake: np.ndarray) -> None:
+    key = _swap_cache_key(source_face)
+    with _SWAP_CACHE_LOCK:
+        _SWAP_CACHE[key] = (
+            fake,
+            target_face.kps.astype(np.float32).copy(),
+            time.perf_counter(),
+        )
+
+
+def _compute_aligned_M(target_face: Face, face_size: int) -> np.ndarray:
+    """Compute the same affine matrix insightface uses internally for
+    norm_crop2 — used for fast cache-hit paste-back when we skip
+    inswapper inference entirely.
+    """
+    from insightface.utils.face_align import estimate_norm
+    return estimate_norm(target_face.kps, face_size, mode="arcface")
+
+
 def _stabilize_kps(face: Face, alpha: float, key: int) -> Face:
     """EMA smooth a face's 5-point keypoints to reduce per-frame detector jitter.
 
@@ -562,22 +659,33 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
 
-        # Use paste_back=False and our optimized paste-back
-        if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
-            with modules.globals.dml_lock:
+        # Try the swap cache first — if the face barely moved since the
+        # last full inference, reuse the aligned fake and just paste it
+        # at the new position.  Saves the entire ~65ms ANE inference.
+        cache_thr = float(getattr(modules.globals, "swap_cache_threshold_px", 0.0))
+        cache_age = float(getattr(modules.globals, "swap_cache_max_age_ms", 0.0))
+        cached_fake = _get_cached_fake(source_face, target_face, cache_thr, cache_age)
+        if cached_fake is not None:
+            bgr_fake = cached_fake
+            M = _compute_aligned_M(target_face, face_swapper.input_size[0])
+        else:
+            # Use paste_back=False and our optimized paste-back
+            if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
+                with modules.globals.dml_lock:
+                    bgr_fake, M = face_swapper.get(
+                        temp_frame, target_face, source_face, paste_back=False
+                    )
+            else:
                 bgr_fake, M = face_swapper.get(
                     temp_frame, target_face, source_face, paste_back=False
                 )
-        else:
-            bgr_fake, M = face_swapper.get(
-                temp_frame, target_face, source_face, paste_back=False
-            )
 
-        if bgr_fake is None:
-            return original_frame
-
-        if not isinstance(bgr_fake, np.ndarray):
-            return original_frame
+            if bgr_fake is None:
+                return original_frame
+            if not isinstance(bgr_fake, np.ndarray):
+                return original_frame
+            if cache_thr > 0 and cache_age > 0:
+                _store_cached_fake(source_face, target_face, bgr_fake)
 
         # Pass a dummy aimg with correct shape — _fast_paste_back only uses aimg.shape
         # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
