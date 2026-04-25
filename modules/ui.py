@@ -753,15 +753,21 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
 
 
 def update_status(text: str) -> None:
+    if status_label is None or ROOT is None:
+        return
     status_label.configure(text=_(text))
     ROOT.update()
 
 
 def update_pop_status(text: str) -> None:
+    if popup_status_label is None:
+        return
     popup_status_label.configure(text=_(text))
 
 
 def update_pop_live_status(text: str) -> None:
+    if popup_status_label_live is None:
+        return
     popup_status_label_live.configure(text=_(text))
 
 

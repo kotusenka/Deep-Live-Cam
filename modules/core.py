@@ -14,13 +14,13 @@ import argparse
 try:
     import torch
     HAS_TORCH = True
-except ImportError:
+except Exception:
     HAS_TORCH = False
 import onnxruntime
 try:
     import tensorflow
     HAS_TENSORFLOW = True
-except ImportError:
+except Exception:
     HAS_TENSORFLOW = False
 
 import modules.globals

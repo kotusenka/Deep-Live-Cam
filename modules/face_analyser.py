@@ -91,10 +91,12 @@ def _optimize_det_model(fa: Any, providers) -> None:
 def _needs_landmark() -> bool:
     """Check whether any active feature requires 106-point landmarks.
 
-    Landmarks are needed by face enhancers and mouth masking, but not
-    by the face swapper alone.
+    Landmarks are needed by face enhancers, mouth masking, and the
+    hull-paste-back quality path; not by the face swapper alone.
     """
     if getattr(modules.globals, "mouth_mask", False):
+        return True
+    if getattr(modules.globals, "hull_mask", False):
         return True
     processors = getattr(modules.globals, "frame_processors", [])
     return any(p in processors for p in
@@ -161,10 +163,11 @@ def get_many_faces(frame: Frame) -> Any:
         return None
 
 def detect_one_face_fast(frame: Frame) -> Any:
-    """Detection-only — skips landmark and recognition models.
+    """Detection-only — skips recognition (and landmark unless required).
 
     Returns a Face with bbox, kps, det_score (enough for face swap).
-    ~10ms vs ~16ms for full get_one_face() at 1080p.
+    Adds 2d106 landmarks when ``hull_mask`` or ``mouth_mask`` is on
+    (~1.5 ms extra).  ~10ms vs ~16ms for full get_one_face() at 1080p.
     """
     from insightface.app.common import Face
     fa = get_face_analyser()
@@ -172,18 +175,30 @@ def detect_one_face_fast(frame: Frame) -> Any:
     if bboxes.shape[0] == 0:
         return None
     idx = int(bboxes[:, 0].argmin())
-    return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+    face = Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
+    if _needs_landmark():
+        lmk = fa.models.get("landmark_2d_106")
+        if lmk is not None:
+            lmk.get(frame, face)
+    return face
 
 
 def detect_many_faces_fast(frame: Frame) -> Any:
-    """Detection-only multi-face — skips landmark and recognition."""
+    """Detection-only multi-face — skips recognition (and landmark
+    unless required by hull_mask / mouth_mask / enhancer)."""
     from insightface.app.common import Face
     fa = get_face_analyser()
     bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
     if bboxes.shape[0] == 0:
         return None
-    return [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
-            for i in range(bboxes.shape[0])]
+    faces = [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
+             for i in range(bboxes.shape[0])]
+    if _needs_landmark():
+        lmk = fa.models.get("landmark_2d_106")
+        if lmk is not None:
+            for face in faces:
+                lmk.get(frame, face)
+    return faces
 
 
 def has_valid_map() -> bool:

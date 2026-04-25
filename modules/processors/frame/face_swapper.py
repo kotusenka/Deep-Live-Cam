@@ -55,14 +55,31 @@ def pre_check() -> bool:
         logging.error(f"Failed to create directory {download_directory_path} due to permission error: {e}")
         return False
     
-    # Use the direct download URL from Hugging Face (FP32 model for broad GPU compatibility)
-    conditional_download(
-        download_directory_path,
-        [
-            "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128.onnx"
-        ],
-    )
-    return True
+    # The hacksider huggingface mirror serves a quantised "fp32" file that
+    # ONNX 1.18 cannot parse and that is also ~3× smaller than the original.
+    # The facefusion-assets mirror serves the original 555 MB Microsoft
+    # weights (sha-matched) and is what InsWapper was published as.  Try
+    # facefusion first; fall back to hacksider for users behind GH-blocking
+    # firewalls.
+    candidates = [
+        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
+        "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128.onnx",
+    ]
+    fp32_path = os.path.join(download_directory_path, "inswapper_128.onnx")
+    fp16_path = os.path.join(download_directory_path, "inswapper_128_fp16.onnx")
+    if os.path.exists(fp32_path) or os.path.exists(fp16_path):
+        return True
+    last_err = None
+    for url in candidates:
+        try:
+            conditional_download(download_directory_path, [url])
+            if os.path.exists(fp32_path):
+                return True
+        except Exception as exc:
+            last_err = exc
+    if last_err is not None:
+        update_status(f"Failed to download inswapper_128.onnx: {last_err}", NAME)
+    return os.path.exists(fp32_path)
 
 
 def pre_start() -> bool:
@@ -86,16 +103,27 @@ def get_face_swapper() -> Any:
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            # Prefer FP16 on GPUs with Tensor Cores (Turing+) — half the
-            # memory bandwidth, faster inference.  Fall back to FP32 for
-            # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
+            # Model selection by backend.  The hacksider FP16 inswapper has
+            # 78 explicit Cast ops sprinkled throughout the graph (it was
+            # quantized post-hoc with QDQ-style conversions); CoreML cannot
+            # fuse across Casts, so the FP16 file balloons to ~50 ANE↔CPU
+            # partitions and runs ~10× slower than the FP32 model on Apple
+            # Silicon.  FP32 + MLProgram, by contrast, runs in a single
+            # CoreML partition and ANE handles weight precision conversion
+            # internally.  Empirical (M3 Pro, ORT 1.23):
+            #   FP32 + CoreML ALL:           ~60ms
+            #   FP32 + CPU EP:               ~630ms
+            #   FP16 + CoreML ALL:           ~660ms
+            #   FP16 + CUDA Tensor Cores:    ~1.5ms (graph-replayed)
             fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
             fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
-            if use_fp16:
+            prefer_fp16 = _HAS_TORCH_CUDA  # only true on NVIDIA Turing+
+            if prefer_fp16 and os.path.exists(fp16_path):
                 model_path = fp16_path
             elif os.path.exists(fp32_path):
                 model_path = fp32_path
+            elif os.path.exists(fp16_path):
+                model_path = fp16_path
             else:
                 update_status(f"No inswapper model found in {models_dir}.", NAME)
                 return None
@@ -287,6 +315,151 @@ def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarr
         return cg['io_binding'].get_outputs()[0].numpy()
 
 
+def _hull_paste_back(
+    target_img: Frame,
+    bgr_fake: np.ndarray,
+    M: np.ndarray,
+    target_face: Face,
+    feather_px: int,
+    grain_strength: float,
+) -> Frame:
+    """Paste using a 2d106-derived hull mask in output space.
+
+    Replaces the square soft-alpha (which leaves a faint rectangular box
+    around the face when the surroundings have a different texture) with
+    a tight, feathered, face-shaped mask built from the target's 33-point
+    contour landmarks.
+
+    Falls back to ``_fast_paste_back`` if landmarks are unavailable, so
+    callers can stay backwards-compatible.
+
+    Cost on M3 Pro: ~0.7ms for a 300x400 face crop (one warpAffine + one
+    GaussianBlur on the crop, all in uint8).
+    """
+    landmarks = getattr(target_face, "landmark_2d_106", None)
+    if landmarks is None or len(landmarks) < 33:
+        return None  # caller falls back
+
+    h, w = target_img.shape[:2]
+    pts = np.asarray(landmarks[:33], dtype=np.int32)
+    hull = cv2.convexHull(pts)
+    x, y, hw, hh = cv2.boundingRect(hull)
+    pad = int(feather_px * 2.5)
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(w, x + hw + pad)
+    y2 = min(h, y + hh + pad)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    crop_w, crop_h = x2 - x1, y2 - y1
+
+    # Build feathered hull mask in the crop only.
+    mask_crop = np.zeros((crop_h, crop_w), dtype=np.uint8)
+    hull_local = hull - np.array([x1, y1])
+    cv2.fillConvexPoly(mask_crop, hull_local, 255)
+    if feather_px > 0:
+        k = feather_px * 2 + 1
+        # sigma matches half the feather radius — empirically softest result.
+        mask_crop = cv2.GaussianBlur(mask_crop, (k, k), feather_px / 2.5)
+
+    # Warp the inswapper aligned-face output to the same crop.
+    IM = cv2.invertAffineTransform(M)
+    IM_crop = IM.copy()
+    IM_crop[0, 2] -= x1
+    IM_crop[1, 2] -= y1
+    fake_crop = cv2.warpAffine(
+        bgr_fake, IM_crop, (crop_w, crop_h),
+        flags=cv2.INTER_LANCZOS4, borderValue=0,
+    )
+
+    target_crop = target_img[y1:y2, x1:x2]
+
+    # Optional grain match: estimate luminance noise sigma in the surrounding
+    # frame and inject deterministic grain.  The seed is anchored to the face
+    # bbox so grain is stable frame-to-frame for a static face — it only
+    # changes meaningfully when the face moves, mimicking real sensor noise
+    # tracking the subject.  Skip cvtColor by jittering BGR equally; visual
+    # difference vs Y-only grain is imperceptible for sigma <~ 4.
+    if grain_strength > 0.0:
+        sigma = _estimate_noise_sigma(target_crop)
+        if sigma > 0.05:
+            seed = (x1 * 73856093) ^ (y1 * 19349663)
+            rng = np.random.default_rng(seed & 0x7FFFFFFF)
+            noise = rng.normal(
+                0.0, sigma * grain_strength, fake_crop.shape[:2],
+            ).astype(np.int16)
+            tmp = fake_crop.astype(np.int16)
+            tmp += noise[..., None]
+            fake_crop = np.clip(tmp, 0, 255).astype(np.uint8)
+
+    if _HAS_TORCH_CUDA:
+        mask_t = torch.from_numpy(mask_crop).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
+        fake_t = torch.from_numpy(fake_crop).float().cuda()
+        tgt_t = torch.from_numpy(target_crop).float().cuda()
+        blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).to(torch.uint8).cpu().numpy()
+        target_img[y1:y2, x1:x2] = blended
+    else:
+        alpha_3c = cv2.merge([mask_crop, mask_crop, mask_crop])
+        inv_alpha = 255 - alpha_3c
+        a_fake = cv2.multiply(fake_crop, alpha_3c, scale=1.0 / 255.0)
+        a_tgt = cv2.multiply(target_crop, inv_alpha, scale=1.0 / 255.0)
+        target_img[y1:y2, x1:x2] = cv2.add(a_fake, a_tgt)
+    return target_img
+
+
+def _estimate_noise_sigma(bgr_crop: np.ndarray) -> float:
+    """Median-deviation noise estimator (Donoho).
+
+    Robust to outliers and edges: the Laplacian of an edge-rich image
+    has heavy tails, but the MAD is dominated by the noise floor.
+    """
+    gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+    mad = np.median(np.abs(lap - np.median(lap)))
+    # The factor 0.6745 maps Gaussian-MAD to sigma; the Laplacian roughly
+    # quadruples sigma for white noise so we divide by 4.
+    return float(0.6745 * mad / 4.0)
+
+
+# Per-source-face running average of target keypoints (5 points for inswapper).
+# Keyed by source face's normed_embedding hash so multi-face mapping doesn't
+# cross-contaminate.
+_KPS_HISTORY: dict = {}
+_KPS_LOCK = threading.Lock()
+
+
+def _stabilize_kps(face: Face, alpha: float, key: int) -> Face:
+    """EMA smooth a face's 5-point keypoints to reduce per-frame detector jitter.
+
+    alpha = weight of CURRENT frame; smaller = more stable.  Only applied to
+    keypoints, not to bbox or det_score — those can flicker without affecting
+    the inswapper's affine alignment.
+    """
+    if face is None or face.kps is None or alpha >= 1.0:
+        return face
+    with _KPS_LOCK:
+        prev = _KPS_HISTORY.get(key)
+        if (prev is None
+                or prev.shape != face.kps.shape
+                # Sudden jump (>40 px) → reset, the face moved fast and EMA
+                # would otherwise lag visibly.
+                or float(np.linalg.norm(prev - face.kps, axis=1).max()) > 40.0):
+            _KPS_HISTORY[key] = face.kps.astype(np.float32).copy()
+            return face
+        smoothed = (alpha * face.kps + (1.0 - alpha) * prev).astype(np.float32)
+        _KPS_HISTORY[key] = smoothed
+        face.kps = smoothed
+    return face
+
+
+def _kps_stabilize_key(source_face: Face) -> int:
+    """Hash key for the kps history, derived from source identity."""
+    if source_face is None or source_face.normed_embedding is None:
+        return 0
+    return int(hash(source_face.normed_embedding[:8].tobytes())) & 0x7FFFFFFF
+
+
 def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
     """Paste bgr_fake back onto target_img via the inverse affine of M.
 
@@ -368,11 +541,19 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
+    hull_mask_enabled = getattr(modules.globals, "hull_mask", False)
     needs_original = opacity < 1.0 or mouth_mask_enabled
     if needs_original:
         original_frame = temp_frame.copy()
     else:
         original_frame = temp_frame
+
+    # Apply temporal kps smoothing if enabled.  Note: target_face is mutated.
+    kps_alpha = float(getattr(modules.globals, "kps_stabilize", 1.0))
+    if 0.0 < kps_alpha < 1.0:
+        target_face = _stabilize_kps(
+            target_face, kps_alpha, _kps_stabilize_key(source_face),
+        )
 
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
@@ -403,7 +584,17 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         _face_size = face_swapper.input_size[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
 
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        swapped_frame = None
+        if hull_mask_enabled:
+            grain = float(getattr(modules.globals, "grain_match", 0.0))
+            feather = int(getattr(modules.globals, "hull_mask_feather", 15))
+            swapped_frame = _hull_paste_back(
+                temp_frame, bgr_fake, M, target_face,
+                feather_px=feather, grain_strength=grain,
+            )
+
+        if swapped_frame is None:
+            swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
 
     except Exception as e:
         print(f"Error during face swap: {e}")

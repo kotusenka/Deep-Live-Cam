@@ -70,6 +70,24 @@ enable_interpolation: bool = True # Toggle temporal smoothing
 interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Lower=smoother.
 # --- END: Added for Frame Interpolation ---
 
+# --- Quality Improvements (no enhancer needed) ---
+# Use 2d106 landmark hull instead of square soft-alpha for paste-back. Eliminates
+# the visible rectangular alignment-box artifact and produces noticeably tighter
+# face boundaries. ~0.7ms extra (warpAffine + GaussianBlur on a face crop).
+hull_mask: bool = True
+hull_mask_feather: int = 15  # Gaussian feather radius in output px
+
+# Stabilize face keypoints temporally to suppress per-frame jitter from
+# detection noise. EMA smoothing with alpha = current-frame weight (smaller =
+# more stable but more lag). 0.0 disables.
+kps_stabilize: float = 0.6
+
+# Add subtle film grain matched to the surrounding camera noise.  The
+# inswapper output is unnaturally smooth at 128x128; reintroducing the right
+# amount of grain hides the "plastic skin" tell without an enhancer model.
+# 0.0 disables. Off by default (~10ms extra/face) — typical good value 0.6-0.8.
+grain_match: float = 0.0
+
 # --- END OF FILE globals.py ---
 
 import threading

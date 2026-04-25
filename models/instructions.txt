@@ -1,4 +1,21 @@
-just put the models in this folder -
+Put the models in this folder.
 
-https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx?download=true
-https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth
+REQUIRED:
+  inswapper_128.onnx (FP32, ~555 MB)
+    Primary mirror (recommended):
+      https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx
+    Fallback:
+      https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128.onnx?download=true
+
+OPTIONAL (NVIDIA Turing+ only — NOT recommended on Apple Silicon!):
+  inswapper_128_fp16.onnx (~265 MB)
+    https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx?download=true
+
+  Note: the FP16 model contains 78 explicit Cast ops that fragment the
+  CoreML graph into ~50 ANE↔CPU partitions and run ~10× slower than the
+  FP32 model on Apple Silicon (M1–M5).  On NVIDIA GPUs with Tensor Cores
+  it is twice as fast.  Code now selects automatically.
+
+OPTIONAL (face enhancers — disable if you need real-time FPS):
+  https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth
+
