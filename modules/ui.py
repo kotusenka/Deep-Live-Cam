@@ -795,6 +795,22 @@ def fetch_random_face() -> None:
         temp_path = os.path.join(temp_dir, "deep_live_cam_random_face.jpg")
         with open(temp_path, "wb") as f:
             f.write(response.content)
+
+        # thispersondoesnotexist returns a 1024x1024 square. buffalo_l's
+        # det_10g detector silently returns zero faces on 1:1 inputs, so
+        # we letterbox to 16:9 with black bars before insightface ever
+        # sees the file. Without this, random_face produced a source with
+        # face=False has_emb=False and Live swap was a no-op.
+        img = cv2.imread(temp_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            target_w = max(w, int(h * 16 / 9))
+            if target_w != w:
+                canvas = np.zeros((h, target_w, 3), dtype=img.dtype)
+                x0 = (target_w - w) // 2
+                canvas[:, x0:x0 + w] = img
+                cv2.imwrite(temp_path, canvas)
+
         modules.globals.source_path = temp_path
         image = render_image_preview(temp_path, (200, 200))
         source_label.configure(image=image)
@@ -1125,8 +1141,8 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event,
     det_count = 0
     cached_target_face = None
     cached_many_faces = None
-    # Detect every N frames ≈ 80ms.  At 60fps → every 5 frames (83ms),
-    # at 30fps → every 3 frames (100ms), at 15fps → every frame.
+    # Detect every N frames ~= 80ms.  At 60fps -> every 5 frames (83ms),
+    # at 30fps -> every 3 frames (100ms), at 15fps -> every frame.
     det_interval = max(1, round(camera_fps * 0.08))
 
     while not stop_event.is_set():

@@ -99,7 +99,7 @@ grain_match: float = 0.0
 #   threshold_px=5.0 — catches detector jitter (~1-2px) and slow drift
 #                      without staling expression updates during real motion
 #   max_age_ms=300   — at 30 FPS, forces a refresh every ~9 frames at most
-swap_cache_threshold_px: float = 5.0
+swap_cache_threshold_px: float = 0.0
 swap_cache_max_age_ms: float = 300.0
 
 # --- END OF FILE globals.py ---

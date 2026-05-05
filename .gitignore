@@ -31,3 +31,4 @@ venv/
 test_data/
 models/inswapper_128*.onnx
 models/inswapper_128_*_coreml.onnx
+.bench/

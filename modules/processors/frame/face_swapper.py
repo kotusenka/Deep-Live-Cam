@@ -539,9 +539,14 @@ def _stabilize_kps(face: Face, alpha: float, key: int) -> Face:
         prev = _KPS_HISTORY.get(key)
         if (prev is None
                 or prev.shape != face.kps.shape
-                # Sudden jump (>40 px) → reset, the face moved fast and EMA
-                # would otherwise lag visibly.
-                or float(np.linalg.norm(prev - face.kps, axis=1).max()) > 40.0):
+                # Sudden jump (>80 px) → reset. Was 40, but on a 5090 / live
+                # webcam the noisy detector occasionally produces 40-50 px
+                # one-frame outliers that triggered the reset and emitted a
+                # full-magnitude jump in the swap mask — visible as the
+                # "mask dancing" complaint. Bench (jitter_bench_median.py)
+                # shows raising the threshold to 80 cuts jerk_max from
+                # ~40 px to ~15 px without measurable lag increase.
+                or float(np.linalg.norm(prev - face.kps, axis=1).max()) > 80.0):
             _KPS_HISTORY[key] = face.kps.astype(np.float32).copy()
             return face
         smoothed = (alpha * face.kps + (1.0 - alpha) * prev).astype(np.float32)
